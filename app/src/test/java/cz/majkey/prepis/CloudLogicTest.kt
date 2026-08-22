@@ -2,6 +2,7 @@ package cz.majkey.prepis
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
@@ -39,5 +40,85 @@ class CloudLogicTest {
         assertEquals("Dobrý den.", parseCloudText("""{"text":"  Dobrý den.  "}"""))
         assertFailsWith<IllegalArgumentException> { parseCloudText("""{"text":" "}""") }
         assertFailsWith<IllegalArgumentException> { parseCloudText("{}") }
+    }
+
+    @Test
+    fun `Groq request uses selected model and Czech hint`() {
+        val fields = multipartFields(TranscriptionProfile.DEFAULT)
+
+        assertEquals("whisper-large-v3", fields["model"])
+        assertEquals("cs", fields["language"])
+        assertEquals("json", fields["response_format"])
+        assertEquals("0", fields["temperature"])
+    }
+
+    @Test
+    fun `auto detection omits language and invalid xAI formatting pair`() {
+        val groq = multipartFields(
+            TranscriptionProfile.DEFAULT.copy(language = TranscriptionLanguage.AUTO),
+        )
+        val xai = multipartFields(
+            TranscriptionProfile(
+                TranscriptionModel.XAI_SPEECH_TO_TEXT,
+                TranscriptionLanguage.AUTO,
+            ),
+        )
+
+        assertFalse("language" in groq)
+        assertFalse("language" in xai)
+        assertFalse("format" in xai)
+    }
+
+    @Test
+    fun `OpenAI request uses selected model`() {
+        val fields = multipartFields(
+            TranscriptionProfile(
+                TranscriptionModel.OPENAI_GPT_TRANSCRIBE,
+                TranscriptionLanguage.ENGLISH,
+            ),
+        )
+
+        assertEquals("gpt-transcribe", fields["model"])
+        assertEquals("en", fields["language"])
+        assertEquals("json", fields["response_format"])
+    }
+
+    @Test
+    fun `Gemini URL and prompt use selected model and language`() {
+        val profile = TranscriptionProfile(
+            TranscriptionModel.GEMINI_3_7_FLASH,
+            TranscriptionLanguage.CZECH,
+        )
+
+        assertEquals(
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent",
+            geminiGenerateUrl(profile),
+        )
+        assertTrue(geminiPrompt(profile.language).contains("Czech"))
+        assertTrue(geminiPrompt(TranscriptionLanguage.AUTO).lowercase().contains("detect"))
+        assertFailsWith<IllegalArgumentException> {
+            geminiGenerateUrl(TranscriptionProfile.DEFAULT)
+        }
+    }
+
+    @Test
+    fun `provider formatting preserves paragraphs and cleans line whitespace`() {
+        assertEquals(
+            "First sentence. Second sentence.\n\nSpeaker 2: Third sentence.",
+            formatProviderTranscript(
+                "  First sentence.   Second sentence.\n\n  Speaker 2: Third sentence.  ",
+            ),
+        )
+        assertEquals(
+            "One. Two. Three.\n\nFour.",
+            formatProviderTranscript("One. Two. Three. Four."),
+        )
+    }
+
+    @Test
+    fun `only transient provider errors are retryable`() {
+        assertTrue(CloudApiException(429).retryable)
+        assertTrue(CloudApiException(503).retryable)
+        assertFalse(CloudApiException(401).retryable)
     }
 }

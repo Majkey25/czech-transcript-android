@@ -15,7 +15,10 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 internal class CloudClient(private val resolver: ContentResolver) {
-    fun transcribe(provider: CloudProvider, rawKey: String, recording: Recording): String {
+    fun transcribe(profile: TranscriptionProfile, rawKey: String, recording: Recording): String {
+        val provider = profile.model.provider
+            ?: throw IllegalArgumentException("Local transcription does not use a cloud client")
+        require(profile.model.supports(profile.language)) { "The model does not support this language" }
         val key = validateApiKey(rawKey)
         val length = recording.size.takeIf { it > 0 } ?: resolver
             .openAssetFileDescriptor(recording.uri, "r")
@@ -35,11 +38,7 @@ internal class CloudClient(private val resolver: ContentResolver) {
                 key,
                 recording,
                 maxBytes,
-                linkedMapOf(
-                    "model" to "gpt-4o-transcribe",
-                    "language" to CZECH_LANGUAGE,
-                    "response_format" to "json",
-                ),
+                multipartFields(profile),
             )
 
             CloudProvider.GROQ -> multipartTranscript(
@@ -48,12 +47,7 @@ internal class CloudClient(private val resolver: ContentResolver) {
                 key,
                 recording,
                 maxBytes,
-                linkedMapOf(
-                    "model" to "whisper-large-v3",
-                    "language" to CZECH_LANGUAGE,
-                    "response_format" to "json",
-                    "temperature" to "0",
-                ),
+                multipartFields(profile),
             )
 
             CloudProvider.XAI -> multipartTranscript(
@@ -62,13 +56,10 @@ internal class CloudClient(private val resolver: ContentResolver) {
                 key,
                 recording,
                 maxBytes,
-                linkedMapOf(
-                    "format" to "true",
-                    "language" to CZECH_LANGUAGE,
-                ),
+                multipartFields(profile),
             )
 
-            CloudProvider.GEMINI -> geminiTranscript(key, recording, length, maxBytes)
+            CloudProvider.GEMINI -> geminiTranscript(profile, key, recording, length, maxBytes)
         }
     }
 
@@ -103,13 +94,14 @@ internal class CloudClient(private val resolver: ContentResolver) {
                 } ?: throw IOException("The recording cannot be opened")
                 writeUtf8(output, "\r\n--$boundary--\r\n")
             }
-            return parseCloudText(readResponse(connection))
+            return formatProviderTranscript(parseCloudText(readResponse(connection)))
         } finally {
             connection.disconnect()
         }
     }
 
     private fun geminiTranscript(
+        profile: TranscriptionProfile,
         key: String,
         recording: Recording,
         length: Long,
@@ -119,7 +111,7 @@ internal class CloudClient(private val resolver: ContentResolver) {
         val uploaded = uploadGeminiFile(uploadUrl, key, recording.uri, length, maxBytes)
         return try {
             val active = waitForGeminiFile(key, uploaded)
-            generateGeminiTranscript(key, active)
+            formatProviderTranscript(generateGeminiTranscript(profile, key, active))
         } finally {
             deleteGeminiFile(key, uploaded.name)
         }
@@ -210,9 +202,12 @@ internal class CloudClient(private val resolver: ContentResolver) {
         }
     }
 
-    private fun generateGeminiTranscript(key: String, file: GeminiFile): String {
-        val prompt = "Transcribe the complete audio verbatim in Czech. Preserve punctuation, paragraphs, " +
-            "and speaker labels when evident. Return only the transcript."
+    private fun generateGeminiTranscript(
+        profile: TranscriptionProfile,
+        key: String,
+        file: GeminiFile,
+    ): String {
+        val prompt = geminiPrompt(profile.language)
         val parts = JSONArray()
             .put(
                 JSONObject().put(
@@ -228,10 +223,9 @@ internal class CloudClient(private val resolver: ContentResolver) {
                 "contents",
                 JSONArray().put(JSONObject().put("role", "user").put("parts", parts)),
             )
-            .put("generation_config", JSONObject().put("temperature", 0))
             .toString()
             .toByteArray(Charsets.UTF_8)
-        val connection = openHttps(GEMINI_GENERATE_URL, GEMINI_HOST).apply {
+        val connection = openHttps(geminiGenerateUrl(profile), GEMINI_HOST).apply {
             requestMethod = "POST"
             doOutput = true
             setFixedLengthStreamingMode(body.size)
@@ -305,9 +299,6 @@ internal class CloudClient(private val resolver: ContentResolver) {
         const val GEMINI_HOST = "generativelanguage.googleapis.com"
         const val GEMINI_UPLOAD_URL = "https://generativelanguage.googleapis.com/upload/v1beta/files"
         const val GEMINI_FILES_URL = "https://generativelanguage.googleapis.com/v1beta"
-        const val GEMINI_GENERATE_URL =
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent"
-        const val CZECH_LANGUAGE = "cs"
         const val MEGABYTE = 1024L * 1024L
         const val NETWORK_BUFFER_SIZE = 64 * 1024
         const val GEMINI_PROCESSING_ATTEMPTS = 300
@@ -316,9 +307,68 @@ internal class CloudClient(private val resolver: ContentResolver) {
     }
 }
 
+internal fun geminiGenerateUrl(profile: TranscriptionProfile): String {
+    require(profile.model.provider == CloudProvider.GEMINI) { "This is not a Gemini model" }
+    return "https://generativelanguage.googleapis.com/v1beta/models/" +
+        "${checkNotNull(profile.model.apiId)}:generateContent"
+}
+
+internal fun geminiPrompt(language: TranscriptionLanguage): String {
+    val target = language.promptName()?.let { "The spoken language is $it. " }
+        ?: "Detect the spoken language. "
+    return "${target}Transcribe the complete audio verbatim. Preserve punctuation, paragraphs, " +
+        "and speaker labels when evident. Do not summarize, translate, or correct the speaker. " +
+        "Return only the transcript."
+}
+
+private fun TranscriptionLanguage.promptName(): String? = when (this) {
+    TranscriptionLanguage.AUTO -> null
+    TranscriptionLanguage.CZECH -> "Czech"
+    TranscriptionLanguage.ENGLISH -> "English"
+    TranscriptionLanguage.SLOVAK -> "Slovak"
+    TranscriptionLanguage.GERMAN -> "German"
+    TranscriptionLanguage.POLISH -> "Polish"
+    TranscriptionLanguage.UKRAINIAN -> "Ukrainian"
+    TranscriptionLanguage.RUSSIAN -> "Russian"
+    TranscriptionLanguage.FRENCH -> "French"
+    TranscriptionLanguage.SPANISH -> "Spanish"
+    TranscriptionLanguage.ITALIAN -> "Italian"
+    TranscriptionLanguage.PORTUGUESE -> "Portuguese"
+    TranscriptionLanguage.DUTCH -> "Dutch"
+    TranscriptionLanguage.HUNGARIAN -> "Hungarian"
+}
+
+internal fun multipartFields(profile: TranscriptionProfile): LinkedHashMap<String, String> {
+    require(profile.model.supports(profile.language)) { "The model does not support this language" }
+    val language = profile.language.apiCode
+    return when (profile.model.provider) {
+        CloudProvider.OPENAI -> linkedMapOf<String, String>().apply {
+            put("model", checkNotNull(profile.model.apiId))
+            language?.let { put("language", it) }
+            put("response_format", "json")
+        }
+
+        CloudProvider.GROQ -> linkedMapOf<String, String>().apply {
+            put("model", checkNotNull(profile.model.apiId))
+            language?.let { put("language", it) }
+            put("response_format", "json")
+            put("temperature", "0")
+        }
+
+        CloudProvider.XAI -> linkedMapOf<String, String>().apply {
+            language?.let {
+                put("format", "true")
+                put("language", it)
+            }
+        }
+
+        else -> throw IllegalArgumentException("This model does not use multipart transcription")
+    }
+}
+
 private fun CloudProvider.maxUploadBytes(): Long = when (this) {
     CloudProvider.OPENAI, CloudProvider.GROQ -> 25L * 1024L * 1024L
-    CloudProvider.XAI -> 100L * 1024L * 1024L
+    CloudProvider.XAI -> 500L * 1024L * 1024L
     CloudProvider.GEMINI -> 500L * 1024L * 1024L
 }
 
@@ -365,8 +415,8 @@ private fun readResponse(connection: HttpsURLConnection, allowEmpty: Boolean = f
     val code = connection.responseCode
     val stream = if (code in 200..299) connection.inputStream else connection.errorStream
     val body = stream?.use { readBounded(it, 1024 * 1024) }.orEmpty()
-    if (code !in 200..299) throw CloudApiException("Provider request failed (HTTP $code)")
-    if (!allowEmpty && body.isBlank()) throw CloudApiException("Provider returned an empty response")
+    if (code !in 200..299) throw CloudApiException(code)
+    if (!allowEmpty && body.isBlank()) throw IOException("Provider returned an empty response")
     return body
 }
 
@@ -384,4 +434,7 @@ private fun readBounded(input: InputStream, maxBytes: Int): String {
     return output.toString(Charsets.UTF_8.name())
 }
 
-internal class CloudApiException(message: String) : IOException(message)
+internal class CloudApiException(val statusCode: Int) :
+    IOException("Provider request failed (HTTP $statusCode)") {
+    val retryable: Boolean get() = statusCode == 429 || statusCode in 500..599
+}

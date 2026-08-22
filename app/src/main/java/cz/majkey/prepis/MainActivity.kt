@@ -95,8 +95,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            PrepisTheme {
-                PrepisApp(model)
+            TranscriberTheme {
+                TranscriberApp(model)
             }
         }
     }
@@ -115,6 +115,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val queue = TranscriptionQueue(app)
     private val cloudQueue = CloudTranscriptionQueue(app)
     private val secrets = SecretStore(app)
+    private val settings = TranscriptionSettingsStore(app)
     private val workManager = WorkManager.getInstance(app)
     private val recordings = MutableStateFlow<List<Recording>>(emptyList())
     private val workInfos = workManager.getWorkInfosByTagFlow(TranscriptionWorker.GLOBAL_TAG)
@@ -132,6 +133,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _configuredProviders = MutableStateFlow<Set<CloudProvider>>(emptySet())
     val configuredProviders: StateFlow<Set<CloudProvider>> = _configuredProviders.asStateFlow()
 
+    private val _profile = MutableStateFlow(settings.load())
+    val profile: StateFlow<TranscriptionProfile> = _profile.asStateFlow()
+
     private val _settingsMessage = MutableStateFlow<String?>(null)
     val settingsMessage: StateFlow<String?> = _settingsMessage.asStateFlow()
 
@@ -139,15 +143,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         .getWorkInfosByTagFlow(CloudTranscriptionWorker.GLOBAL_TAG)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
-    val rows: StateFlow<List<RecordingRow>> = combine(recordings, workInfos) { files, work ->
+    val rows: StateFlow<List<RecordingRow>> = combine(
+        recordings,
+        workInfos,
+        cloudWorkInfos,
+        _profile,
+        _configuredProviders,
+    ) { files, localWork, cloudWork, profile, configured ->
         withContext(Dispatchers.IO) {
-            files.map { recording -> recording.toRow(work, transcripts.exists(recording.key)) }
+            files.map { recording ->
+                recording.toRow(localWork, cloudWork, profile, configured)
+            }
         }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
-
-    init {
-        refreshConfiguredProviders()
-    }
 
     fun selectFolder(uri: Uri) {
         try {
@@ -187,6 +195,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun refresh() {
         refreshJob?.cancel()
         refreshJob = viewModelScope.launch {
+            _configuredProviders.value = withContext(Dispatchers.IO) {
+                secrets.configuredProviders()
+            }
             val uri = folders.load()
             _folderUri.value = uri
             if (uri == null) {
@@ -200,7 +211,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val files = withContext(Dispatchers.IO) { scanner.scan(uri) }
                 recordings.value = files
-                queue.enqueueMissing(files)
+                enqueueMissing(files)
             } catch (exception: CancellationException) {
                 throw exception
             } catch (_: SecurityException) {
@@ -217,11 +228,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun enqueue(recording: Recording, replace: Boolean = false) {
-        viewModelScope.launch { queue.enqueue(recording, replace) }
+        enqueue(recording, _profile.value, replace)
     }
 
-    fun enqueueCloud(recording: Recording, provider: CloudProvider) {
-        if (provider in _configuredProviders.value) cloudQueue.enqueue(recording, provider)
+    fun enqueue(
+        recording: Recording,
+        profile: TranscriptionProfile,
+        replace: Boolean = false,
+    ) {
+        viewModelScope.launch {
+            if (profile.model.isLocal) {
+                queue.enqueue(recording, profile, replace)
+            } else if (profile.model.provider in _configuredProviders.value) {
+                cloudQueue.enqueue(recording, profile, replace)
+            }
+        }
     }
 
     fun saveApiKey(provider: CloudProvider, key: String) {
@@ -229,6 +250,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _settingsMessage.value = try {
                 secrets.put(provider, key)
                 _configuredProviders.value = secrets.configuredProviders()
+                _profile.value.takeIf { it.model.provider == provider }?.let { profile ->
+                    cloudQueue.enqueueMissing(recordings.value, profile, retryErrors = true)
+                }
                 app.getString(R.string.api_key_saved, app.getString(provider.nameResource()))
             } catch (_: IllegalArgumentException) {
                 app.getString(R.string.api_key_invalid)
@@ -242,6 +266,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             secrets.remove(provider)
             _configuredProviders.value = secrets.configuredProviders()
+            refresh()
             _settingsMessage.value = app.getString(
                 R.string.api_key_removed,
                 app.getString(provider.nameResource()),
@@ -249,51 +274,94 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun saveProfile(profile: TranscriptionProfile) {
+        require(profile.model.supports(profile.language)) { "The model does not support this language" }
+        settings.save(profile)
+        _profile.value = profile
+    }
+
     fun clearSettingsMessage() {
         _settingsMessage.value = null
     }
 
-    suspend fun readTranscripts(key: String): Map<TranscriptSource, String> =
-        withContext(Dispatchers.IO) {
-            TranscriptSource.entries.mapNotNull { source ->
-                transcripts.read(key, source)?.let { source to it }
-            }.toMap()
-        }
+    suspend fun readTranscripts(key: String): Map<TranscriptionProfile, String> =
+        withContext(Dispatchers.IO) { transcripts.readAll(key) }
 
-    private fun refreshConfiguredProviders() {
-        viewModelScope.launch(Dispatchers.IO) {
-            _configuredProviders.value = secrets.configuredProviders()
+    private suspend fun enqueueMissing(files: List<Recording>) {
+        val profile = _profile.value
+        if (profile.model.isLocal) {
+            queue.enqueueMissing(files, profile)
+        } else if (profile.model.provider in _configuredProviders.value) {
+            cloudQueue.enqueueMissing(files, profile)
         }
     }
 
-    private fun Recording.toRow(work: List<WorkInfo>, transcriptExists: Boolean): RecordingRow {
-        if (transcriptExists) return RecordingRow(this, RecordingStatus.DONE)
+    private fun Recording.toRow(
+        localWork: List<WorkInfo>,
+        cloudWork: List<WorkInfo>,
+        profile: TranscriptionProfile,
+        configured: Set<CloudProvider>,
+    ): RecordingRow {
+        val hasTranscript = transcripts.hasAny(key)
+        if (transcripts.exists(key, profile)) {
+            return RecordingRow(this, RecordingStatus.DONE, hasTranscript = true)
+        }
+        val provider = profile.model.provider
+        if (provider != null && provider !in configured) {
+            return RecordingRow(this, RecordingStatus.SETUP, hasTranscript)
+        }
 
-        val tagged = work.filter { TranscriptionWorker.recordingTag(key) in it.tags }
+        val tagged = if (profile.model.isLocal) {
+            localWork.filter { TranscriptionWorker.recordingTag(key, profile) in it.tags }
+        } else {
+            cloudWork.filter { CloudTranscriptionWorker.recordingTag(key, profile) in it.tags }
+        }
         val active = tagged.lastOrNull { it.state == WorkInfo.State.RUNNING } ?:
             tagged.lastOrNull { it.state == WorkInfo.State.ENQUEUED || it.state == WorkInfo.State.BLOCKED }
         if (active != null) {
-            val phase = active.progress.getString(TranscriptionWorker.KEY_PHASE)
             return RecordingRow(
                 this,
-                when (phase) {
-                    TranscriptionWorker.PHASE_MODEL -> RecordingStatus.MODEL
-                    TranscriptionWorker.PHASE_TRANSCRIBING -> RecordingStatus.TRANSCRIBING
+                when {
+                    !profile.model.isLocal && active.state == WorkInfo.State.RUNNING ->
+                        RecordingStatus.TRANSCRIBING
+                    profile.model.isLocal -> when (
+                        active.progress.getString(TranscriptionWorker.KEY_PHASE)
+                    ) {
+                        TranscriptionWorker.PHASE_MODEL -> RecordingStatus.MODEL
+                        TranscriptionWorker.PHASE_TRANSCRIBING -> RecordingStatus.TRANSCRIBING
+                        else -> RecordingStatus.WAITING
+                    }
                     else -> RecordingStatus.WAITING
                 },
+                hasTranscript,
             )
         }
 
         val error = tagged.lastOrNull { it.state == WorkInfo.State.SUCCEEDED }
             ?.outputData
-            ?.getString(TranscriptionWorker.KEY_ERROR)
-        return RecordingRow(this, if (error == null) RecordingStatus.WAITING else RecordingStatus.ERROR)
+            ?.getString(
+                if (profile.model.isLocal) {
+                    TranscriptionWorker.KEY_ERROR
+                } else {
+                    CloudTranscriptionWorker.KEY_ERROR
+                },
+            )
+        return RecordingRow(
+            this,
+            when {
+                error == null -> RecordingStatus.WAITING
+                hasTranscript -> RecordingStatus.ERROR_WITH_TRANSCRIPT
+                else -> RecordingStatus.ERROR
+            },
+            hasTranscript,
+        )
     }
 }
 
 data class RecordingRow(
     val recording: Recording,
     val status: RecordingStatus,
+    val hasTranscript: Boolean = false,
 )
 
 enum class RecordingStatus {
@@ -302,15 +370,18 @@ enum class RecordingStatus {
     TRANSCRIBING,
     DONE,
     ERROR,
+    ERROR_WITH_TRANSCRIPT,
+    SETUP,
 }
 
 @Composable
-private fun PrepisApp(model: MainViewModel) {
+private fun TranscriberApp(model: MainViewModel) {
     val folderUri by model.folderUri.collectAsState()
     val loading by model.loading.collectAsState()
     val folderError by model.folderError.collectAsState()
     val rows by model.rows.collectAsState()
     val configuredProviders by model.configuredProviders.collectAsState()
+    val profile by model.profile.collectAsState()
     val cloudWorkInfos by model.cloudWorkInfos.collectAsState()
     val settingsMessage by model.settingsMessage.collectAsState()
     var selectedKey by rememberSaveable { mutableStateOf<String?>(null) }
@@ -321,19 +392,23 @@ private fun PrepisApp(model: MainViewModel) {
     }
 
     when {
-        settingsOpen -> AdvancedSettingsScreen(
+        settingsOpen -> SettingsScreen(
+            profile = profile,
             configuredProviders = configuredProviders,
             message = settingsMessage,
             onBack = {
                 model.clearSettingsMessage()
+                model.refresh()
                 settingsOpen = false
             },
+            onProfile = model::saveProfile,
             onSave = model::saveApiKey,
             onRemove = model::removeApiKey,
         )
 
         selected != null -> TranscriptScreen(
             row = selected,
+            selectedProfile = profile,
             configuredProviders = configuredProviders,
             cloudWorkInfos = cloudWorkInfos,
             readTranscripts = model::readTranscripts,
@@ -342,7 +417,9 @@ private fun PrepisApp(model: MainViewModel) {
                 model.enqueue(selected.recording, replace = true)
                 selectedKey = null
             },
-            onCloudTranscribe = { provider -> model.enqueueCloud(selected.recording, provider) },
+            onTranscribe = { selectedProfile ->
+                model.enqueue(selected.recording, selectedProfile)
+            },
         )
 
         folderUri == null -> FolderScreen(
@@ -358,8 +435,10 @@ private fun PrepisApp(model: MainViewModel) {
             onAdvancedSettings = { settingsOpen = true },
             onRetry = model::refresh,
             onRecording = { row ->
-                if (row.status == RecordingStatus.DONE) {
+                if (row.hasTranscript) {
                     selectedKey = row.recording.key
+                } else if (row.status == RecordingStatus.SETUP) {
+                    settingsOpen = true
                 } else {
                     model.enqueue(row.recording)
                 }
@@ -480,8 +559,11 @@ private fun RecordingItem(row: RecordingRow, onRecording: (RecordingRow) -> Unit
                 RecordingStatus.MODEL, RecordingStatus.TRANSCRIBING ->
                     CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
                 RecordingStatus.DONE -> Text("✓", style = MaterialTheme.typography.titleLarge)
-                RecordingStatus.ERROR -> Text("!", style = MaterialTheme.typography.titleLarge)
+                RecordingStatus.ERROR,
+                RecordingStatus.ERROR_WITH_TRANSCRIPT,
+                -> Text("!", style = MaterialTheme.typography.titleLarge)
                 RecordingStatus.WAITING -> Text("…", style = MaterialTheme.typography.titleLarge)
+                RecordingStatus.SETUP -> Text("⚙", style = MaterialTheme.typography.titleLarge)
             }
         },
         modifier = Modifier
@@ -497,28 +579,30 @@ private fun RecordingItem(row: RecordingRow, onRecording: (RecordingRow) -> Unit
 @Composable
 private fun TranscriptScreen(
     row: RecordingRow,
+    selectedProfile: TranscriptionProfile,
     configuredProviders: Set<CloudProvider>,
     cloudWorkInfos: List<WorkInfo>,
-    readTranscripts: suspend (String) -> Map<TranscriptSource, String>,
+    readTranscripts: suspend (String) -> Map<TranscriptionProfile, String>,
     onBack: () -> Unit,
     onRetranscribe: () -> Unit,
-    onCloudTranscribe: (CloudProvider) -> Unit,
+    onTranscribe: (TranscriptionProfile) -> Unit,
 ) {
     val context = LocalContext.current
     var menuOpen by remember { mutableStateOf(false) }
     var sourceMenuOpen by remember { mutableStateOf(false) }
     var cloudDialogOpen by remember { mutableStateOf(false) }
     var transcripts by remember(row.recording.key) {
-        mutableStateOf<Map<TranscriptSource, String>>(emptyMap())
+        mutableStateOf<Map<TranscriptionProfile, String>>(emptyMap())
     }
-    var selectedSource by rememberSaveable(row.recording.key) { mutableStateOf(TranscriptSource.LOCAL) }
-    var requestedProvider by remember(row.recording.key) { mutableStateOf<CloudProvider?>(null) }
+    var selectedProfileId by rememberSaveable(row.recording.key) { mutableStateOf(selectedProfile.id) }
+    var requestedProfile by remember(row.recording.key) { mutableStateOf<TranscriptionProfile?>(null) }
     var loaded by remember(row.recording.key) { mutableStateOf(false) }
     val backDescription = stringResource(R.string.back)
     val menuDescription = stringResource(R.string.menu)
     val relevantWork = cloudWorkInfos.filter { info ->
-        CloudProvider.entries.any { provider ->
-            CloudTranscriptionWorker.recordingTag(row.recording.key, provider) in info.tags
+        TranscriptionProfile.ALL.any { profile ->
+            !profile.model.isLocal &&
+                CloudTranscriptionWorker.recordingTag(row.recording.key, profile) in info.tags
         }
     }
     val activeWork = relevantWork.lastOrNull {
@@ -526,28 +610,35 @@ private fun TranscriptScreen(
             it.state == WorkInfo.State.ENQUEUED ||
             it.state == WorkInfo.State.BLOCKED
     }
-    val activeProvider = activeWork?.let { info ->
-        CloudProvider.entries.firstOrNull { provider ->
-            CloudTranscriptionWorker.recordingTag(row.recording.key, provider) in info.tags
+    val activeProfile = activeWork?.let { info ->
+        TranscriptionProfile.ALL.firstOrNull { profile ->
+            !profile.model.isLocal &&
+                CloudTranscriptionWorker.recordingTag(row.recording.key, profile) in info.tags
         }
     }
-    val requestedError = requestedProvider?.let { provider ->
+    val requestedError = requestedProfile?.let { profile ->
         relevantWork.lastOrNull {
-            CloudTranscriptionWorker.recordingTag(row.recording.key, provider) in it.tags &&
+            CloudTranscriptionWorker.recordingTag(row.recording.key, profile) in it.tags &&
                 it.state == WorkInfo.State.SUCCEEDED
         }?.outputData?.getString(CloudTranscriptionWorker.KEY_ERROR)
     }
 
-    LaunchedEffect(row.recording.key, cloudWorkInfos, requestedProvider) {
+    LaunchedEffect(row.recording.key, cloudWorkInfos, requestedProfile) {
         transcripts = readTranscripts(row.recording.key)
-        if (selectedSource !in transcripts) selectedSource = TranscriptSource.LOCAL
-        requestedProvider?.takeIf { it.source in transcripts }?.let {
-            selectedSource = it.source
-            requestedProvider = null
+        val selectedExists = transcripts.keys.any { it.id == selectedProfileId }
+        if (!selectedExists) {
+            selectedProfileId = transcripts.keys.firstOrNull { it == selectedProfile }?.id
+                ?: transcripts.keys.firstOrNull()?.id
+                ?: selectedProfile.id
+        }
+        requestedProfile?.takeIf { it in transcripts }?.let {
+            selectedProfileId = it.id
+            requestedProfile = null
         }
         loaded = true
     }
-    val transcript = transcripts[selectedSource] ?: transcripts[TranscriptSource.LOCAL]
+    val visibleProfile = transcripts.keys.firstOrNull { it.id == selectedProfileId }
+    val transcript = visibleProfile?.let(transcripts::get)
 
     if (cloudDialogOpen) {
         AlertDialog(
@@ -557,16 +648,21 @@ private fun TranscriptScreen(
                 Column {
                     Text(stringResource(R.string.cloud_upload_notice))
                     Spacer(Modifier.height(8.dp))
-                    CloudProvider.entries.filter { it in configuredProviders }.forEach { provider ->
+                    TranscriptionModel.entries.filter { model ->
+                        model.provider in configuredProviders
+                    }.forEach { model ->
+                        val language = selectedProfile.language.takeIf(model::supports)
+                            ?: TranscriptionLanguage.AUTO
+                        val profile = TranscriptionProfile(model, language)
                         TextButton(
                             onClick = {
-                                requestedProvider = provider
-                                onCloudTranscribe(provider)
+                                requestedProfile = profile
+                                onTranscribe(profile)
                                 cloudDialogOpen = false
                             },
                             modifier = Modifier.fillMaxWidth(),
                         ) {
-                            Text(stringResource(provider.nameResource()))
+                            Text(sourceName(profile))
                         }
                     }
                 }
@@ -622,7 +718,7 @@ private fun TranscriptScreen(
                         )
                         DropdownMenuItem(
                             text = { Text(stringResource(R.string.cloud_transcription)) },
-                            enabled = configuredProviders.isNotEmpty() && activeProvider == null,
+                            enabled = configuredProviders.isNotEmpty() && activeProfile == null,
                             onClick = {
                                 menuOpen = false
                                 cloudDialogOpen = true
@@ -657,17 +753,17 @@ private fun TranscriptScreen(
                         Spacer(Modifier.weight(1f))
                         Box {
                             TextButton(onClick = { sourceMenuOpen = true }) {
-                                Text(sourceName(selectedSource))
+                                Text(sourceName(visibleProfile))
                             }
                             DropdownMenu(
                                 expanded = sourceMenuOpen,
                                 onDismissRequest = { sourceMenuOpen = false },
                             ) {
-                                TranscriptSource.entries.filter { it in transcripts }.forEach { source ->
+                                transcripts.keys.forEach { profile ->
                                     DropdownMenuItem(
-                                        text = { Text(sourceName(source)) },
+                                        text = { Text(sourceName(profile)) },
                                         onClick = {
-                                            selectedSource = source
+                                            selectedProfileId = profile.id
                                             sourceMenuOpen = false
                                         },
                                     )
@@ -676,12 +772,12 @@ private fun TranscriptScreen(
                         }
                     }
                 }
-                if (activeProvider != null) {
+                if (activeProfile != null) {
                     LinearProgressIndicator(Modifier.fillMaxWidth())
                     Text(
                         stringResource(
                             R.string.cloud_in_progress,
-                            stringResource(activeProvider.nameResource()),
+                            sourceName(activeProfile),
                         ),
                         modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
                         style = MaterialTheme.typography.bodySmall,
@@ -710,13 +806,9 @@ private fun TranscriptScreen(
 }
 
 @Composable
-private fun sourceName(source: TranscriptSource): String = when (source) {
-    TranscriptSource.LOCAL -> stringResource(R.string.source_local)
-    TranscriptSource.OPENAI -> stringResource(R.string.provider_openai)
-    TranscriptSource.GEMINI -> stringResource(R.string.provider_gemini)
-    TranscriptSource.XAI -> stringResource(R.string.provider_xai)
-    TranscriptSource.GROQ -> stringResource(R.string.provider_groq)
-}
+private fun sourceName(profile: TranscriptionProfile): String =
+    "${stringResource(profile.model.nameResource())} · " +
+        stringResource(profile.language.nameResource())
 
 @Composable
 private fun CenteredProgress(padding: PaddingValues) {
@@ -751,6 +843,8 @@ private fun statusText(status: RecordingStatus): String = stringResource(
         RecordingStatus.TRANSCRIBING -> R.string.status_transcribing
         RecordingStatus.DONE -> R.string.status_done
         RecordingStatus.ERROR -> R.string.status_error
+        RecordingStatus.ERROR_WITH_TRANSCRIPT -> R.string.status_error_existing
+        RecordingStatus.SETUP -> R.string.status_setup
     },
 )
 
@@ -763,7 +857,7 @@ private fun copyTranscript(context: Context, text: String) {
 private fun Recording.displayName(): String = if (isM4a(name)) name.dropLast(4) else name
 
 @Composable
-private fun PrepisTheme(content: @Composable () -> Unit) {
+private fun TranscriberTheme(content: @Composable () -> Unit) {
     val context = LocalContext.current
     val dark = isSystemInDarkTheme()
     val colors = when {

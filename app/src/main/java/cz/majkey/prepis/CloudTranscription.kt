@@ -8,29 +8,29 @@ import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Build
 import androidx.core.app.NotificationCompat
+import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingWorkPolicy
 import androidx.work.ForegroundInfo
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import java.io.IOException
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
-enum class CloudProvider(
-    val id: String,
-    val source: TranscriptSource,
-) {
-    OPENAI("openai", TranscriptSource.OPENAI),
-    GEMINI("gemini", TranscriptSource.GEMINI),
-    XAI("xai", TranscriptSource.XAI),
-    GROQ("groq", TranscriptSource.GROQ),
+enum class CloudProvider(val id: String) {
+    GROQ("groq"),
+    GEMINI("gemini"),
+    OPENAI("openai"),
+    XAI("xai"),
     ;
 
     companion object {
@@ -72,7 +72,13 @@ class CloudTranscriptionWorker(
     parameters: WorkerParameters,
 ) : CoroutineWorker(appContext, parameters) {
     override suspend fun doWork(): Result {
-        val provider = inputData.getString(KEY_PROVIDER)?.let(CloudProvider::fromId)
+        val profile = runCatching {
+            TranscriptionProfile.fromIds(
+                inputData.getString(KEY_MODEL) ?: return Result.failure(),
+                inputData.getString(KEY_LANGUAGE) ?: return Result.failure(),
+            )
+        }.getOrNull() ?: return Result.failure()
+        val provider = profile.model.provider
             ?: return Result.failure()
         val uri = inputData.getString(KEY_URI)?.let(Uri::parse) ?: return Result.failure()
         val key = inputData.getString(KEY_RECORDING) ?: return Result.failure()
@@ -85,16 +91,22 @@ class CloudTranscriptionWorker(
             setForeground(createForegroundInfo(provider, key))
             val recording = Recording(uri, name, size, lastModified = 0, key = key)
             val transcript = withContext(Dispatchers.IO) {
-                CloudClient(applicationContext.contentResolver).transcribe(provider, apiKey, recording)
+                CloudClient(applicationContext.contentResolver).transcribe(profile, apiKey, recording)
             }
             withContext(Dispatchers.IO) {
-                TranscriptStore(applicationContext).write(key, transcript, provider.source)
+                TranscriptStore(applicationContext).write(key, transcript, profile)
             }
-            Result.success(workDataOf(KEY_PROVIDER to provider.id))
+            Result.success()
         } catch (exception: CancellationException) {
             throw exception
         } catch (exception: Exception) {
-            Result.success(workDataOf(KEY_ERROR to exception.cloudUserMessage()))
+            if (exception is CloudApiException && exception.retryable &&
+                runAttemptCount < MAX_TRANSIENT_RETRIES
+            ) {
+                Result.retry()
+            } else {
+                Result.success(workDataOf(KEY_ERROR to exception.cloudUserMessage()))
+            }
         }
     }
 
@@ -126,18 +138,21 @@ class CloudTranscriptionWorker(
     companion object {
         const val GLOBAL_TAG = "cloud-transcriptions"
         const val KEY_ERROR = "error"
-        const val KEY_PROVIDER = "provider"
 
         private const val KEY_URI = "uri"
         private const val KEY_RECORDING = "recording"
         private const val KEY_NAME = "name"
         private const val KEY_SIZE = "size"
+        private const val KEY_MODEL = "model"
+        private const val KEY_LANGUAGE = "language"
         private const val NOTIFICATION_CHANNEL = "transcription"
+        private const val MAX_TRANSIENT_RETRIES = 4
 
-        fun recordingTag(key: String, provider: CloudProvider) = "cloud-$key-${provider.id}"
+        fun recordingTag(key: String, profile: TranscriptionProfile) = "cloud-$key-${profile.id}"
 
-        fun input(recording: Recording, provider: CloudProvider) = workDataOf(
-            KEY_PROVIDER to provider.id,
+        fun input(recording: Recording, profile: TranscriptionProfile) = workDataOf(
+            KEY_MODEL to profile.model.id,
+            KEY_LANGUAGE to profile.language.id,
             KEY_URI to recording.uri.toString(),
             KEY_RECORDING to recording.key,
             KEY_NAME to recording.name,
@@ -147,25 +162,65 @@ class CloudTranscriptionWorker(
 }
 
 class CloudTranscriptionQueue(context: Context) {
-    private val manager = WorkManager.getInstance(context.applicationContext)
+    private val appContext = context.applicationContext
+    private val manager = WorkManager.getInstance(appContext)
+    private val transcripts = TranscriptStore(appContext)
 
-    fun enqueue(recording: Recording, provider: CloudProvider) {
-        val uniqueName = CloudTranscriptionWorker.recordingTag(recording.key, provider)
+    suspend fun enqueueMissing(
+        recordings: List<Recording>,
+        profile: TranscriptionProfile,
+        retryErrors: Boolean = false,
+    ) {
+        for (recording in recordings) {
+            if (!transcripts.exists(recording.key, profile)) {
+                enqueue(recording, profile, automatic = !retryErrors)
+            }
+        }
+    }
+
+    suspend fun enqueue(
+        recording: Recording,
+        profile: TranscriptionProfile,
+        replace: Boolean = false,
+        automatic: Boolean = false,
+    ) = withContext(Dispatchers.IO) {
+        require(profile.model.provider != null) { "Cloud queue requires a cloud model" }
+        val uniqueName = CloudTranscriptionWorker.recordingTag(recording.key, profile)
+        val existing = manager.getWorkInfosByTag(uniqueName).get()
+        if (existing.any { it.state.isActive() }) return@withContext
+        if (automatic && existing.any {
+                it.state == WorkInfo.State.SUCCEEDED &&
+                    it.outputData.getString(CloudTranscriptionWorker.KEY_ERROR) != null
+            }
+        ) {
+            return@withContext
+        }
+        if (replace && !transcripts.delete(recording.key, profile)) {
+            throw IOException("The previous transcript cannot be removed")
+        }
         val request = OneTimeWorkRequestBuilder<CloudTranscriptionWorker>()
-            .setInputData(CloudTranscriptionWorker.input(recording, provider))
+            .setInputData(CloudTranscriptionWorker.input(recording, profile))
             .setConstraints(
                 Constraints.Builder()
                     .setRequiredNetworkType(NetworkType.CONNECTED)
                     .build(),
             )
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             .addTag(CloudTranscriptionWorker.GLOBAL_TAG)
             .addTag(uniqueName)
             .build()
-        manager.enqueueUniqueWork(uniqueName, ExistingWorkPolicy.KEEP, request)
+        manager.beginUniqueWork(QUEUE_NAME, ExistingWorkPolicy.APPEND_OR_REPLACE, request).enqueue()
     }
 
     suspend fun cancelAll() = withContext(Dispatchers.IO) {
-        manager.cancelAllWorkByTag(CloudTranscriptionWorker.GLOBAL_TAG).result.get()
+        manager.cancelUniqueWork(QUEUE_NAME).result.get()
+    }
+
+    private fun WorkInfo.State.isActive() =
+        this == WorkInfo.State.ENQUEUED || this == WorkInfo.State.RUNNING || this == WorkInfo.State.BLOCKED
+
+    private companion object {
+        const val QUEUE_NAME = "cloud-transcription-queue"
     }
 }
 

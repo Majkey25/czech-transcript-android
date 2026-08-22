@@ -19,6 +19,7 @@ import kotlin.math.min
 class AudioTranscriber(
     private val resolver: ContentResolver,
     private val modelDirectory: File,
+    private val language: TranscriptionLanguage = TranscriptionLanguage.CZECH,
 ) {
     fun transcribe(uri: Uri): String {
         val recognizer = createRecognizer()
@@ -40,7 +41,7 @@ class AudioTranscriber(
         }
 
         return formatTranscript(parts).ifBlank {
-            throw IOException("The recording contains no recognizable Czech speech")
+            throw IOException("The recording contains no recognizable speech")
         }
     }
 
@@ -48,7 +49,7 @@ class AudioTranscriber(
         val whisper = OfflineWhisperModelConfig(
             encoder = modelDirectory.resolve(ENCODER_FILE).path,
             decoder = modelDirectory.resolve(DECODER_FILE).path,
-            language = "cs",
+            language = localWhisperLanguage(language),
             task = "transcribe",
             tailPaddings = 500,
         )
@@ -73,7 +74,7 @@ class AudioTranscriber(
                     extractor.getTrackFormat(index)
                         .getString(MediaFormat.KEY_MIME)
                         ?.startsWith("audio/") == true
-                } ?: throw IOException("Soubor neobsahuje zvukovou stopu")
+                } ?: throw IOException("The file contains no audio track")
 
                 extractor.selectTrack(trackIndex)
                 decodeTrack(extractor, extractor.getTrackFormat(trackIndex), consume)
@@ -184,6 +185,9 @@ class AudioTranscriber(
         private const val MAX_IDLE_CYCLES = 3_000
     }
 }
+
+internal fun localWhisperLanguage(language: TranscriptionLanguage): String =
+    language.apiCode.orEmpty()
 
 internal class PcmChunker(
     private val channelCount: Int,

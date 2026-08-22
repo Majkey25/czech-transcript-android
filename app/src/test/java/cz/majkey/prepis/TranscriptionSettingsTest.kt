@@ -1,0 +1,80 @@
+package cz.majkey.prepis
+
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertNull
+
+class TranscriptionSettingsTest {
+    @Test
+    fun `quality default is Groq Large V3 in Czech`() {
+        assertEquals(TranscriptionModel.GROQ_LARGE_V3, TranscriptionProfile.DEFAULT.model)
+        assertEquals(TranscriptionLanguage.CZECH, TranscriptionProfile.DEFAULT.language)
+    }
+
+    @Test
+    fun `model and language IDs use fixed allowlists`() {
+        assertEquals(
+            TranscriptionModel.OPENAI_GPT_4O,
+            TranscriptionModel.fromId("openai-gpt-4o-transcribe"),
+        )
+        assertEquals(TranscriptionLanguage.SLOVAK, TranscriptionLanguage.fromId("sk"))
+        assertFailsWith<IllegalArgumentException> { TranscriptionModel.fromId("custom-model") }
+        assertFailsWith<IllegalArgumentException> { TranscriptionLanguage.fromId("xx") }
+    }
+
+    @Test
+    fun `auto detection omits the provider language hint`() {
+        assertNull(TranscriptionLanguage.AUTO.apiCode)
+        assertEquals("cs", TranscriptionLanguage.CZECH.apiCode)
+        assertEquals("", localWhisperLanguage(TranscriptionLanguage.AUTO))
+        assertEquals("cs", localWhisperLanguage(TranscriptionLanguage.CZECH))
+    }
+
+    @Test
+    fun `profile IDs separate model and language results`() {
+        val czech = TranscriptionProfile(
+            TranscriptionModel.GROQ_LARGE_V3,
+            TranscriptionLanguage.CZECH,
+        )
+        val english = czech.copy(language = TranscriptionLanguage.ENGLISH)
+        val turbo = czech.copy(model = TranscriptionModel.GROQ_LARGE_V3_TURBO)
+
+        assertEquals("groq-whisper-large-v3-cs", czech.id)
+        assertEquals("groq-whisper-large-v3-en", english.id)
+        assertEquals("groq-whisper-large-v3-turbo-cs", turbo.id)
+    }
+
+    @Test
+    fun `xAI exposes only documented language hints`() {
+        assertEquals(true, TranscriptionModel.XAI_SPEECH_TO_TEXT.supports(TranscriptionLanguage.CZECH))
+        assertEquals(true, TranscriptionModel.XAI_SPEECH_TO_TEXT.supports(TranscriptionLanguage.AUTO))
+        assertEquals(false, TranscriptionModel.XAI_SPEECH_TO_TEXT.supports(TranscriptionLanguage.SLOVAK))
+        assertEquals(true, TranscriptionModel.GROQ_LARGE_V3.supports(TranscriptionLanguage.SLOVAK))
+        assertFailsWith<IllegalArgumentException> {
+            TranscriptionProfile.fromIds("xai-speech-to-text", "sk")
+        }
+    }
+
+    @Test
+    fun `transcript filenames preserve legacy results and separate new variants`() {
+        val localCzech = TranscriptionProfile(
+            TranscriptionModel.LOCAL_WHISPER_SMALL,
+            TranscriptionLanguage.CZECH,
+        )
+        val groqCzech = TranscriptionProfile.DEFAULT
+        val groqEnglish = groqCzech.copy(language = TranscriptionLanguage.ENGLISH)
+
+        assertEquals("recording.txt", transcriptFileName("recording", localCzech))
+        assertEquals(
+            "recording-groq-whisper-large-v3-cs.txt",
+            transcriptFileName("recording", groqCzech),
+        )
+        assertEquals(
+            "recording-groq-whisper-large-v3-en.txt",
+            transcriptFileName("recording", groqEnglish),
+        )
+        assertEquals("recording-groq.txt", legacyTranscriptFileName("recording", groqCzech))
+        assertNull(legacyTranscriptFileName("recording", groqEnglish))
+    }
+}

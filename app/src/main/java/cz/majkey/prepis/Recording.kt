@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import android.provider.DocumentsContract
 import androidx.core.content.edit
+import java.io.File
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
@@ -17,13 +18,11 @@ data class Recording(
     val key: String = recordingKey(uri.toString(), size, lastModified),
 )
 
-enum class TranscriptSource(val id: String) {
-    LOCAL("local"),
-    OPENAI("openai"),
-    GEMINI("gemini"),
-    XAI("xai"),
-    GROQ("groq"),
-}
+internal fun transcriptFileName(key: String, profile: TranscriptionProfile): String =
+    if (profile == LEGACY_LOCAL_PROFILE) "$key.txt" else "$key-${profile.id}.txt"
+
+internal fun legacyTranscriptFileName(key: String, profile: TranscriptionProfile): String? =
+    LEGACY_CLOUD_PROFILES[profile]?.let { "$key-$it.txt" }
 
 fun isM4a(name: String): Boolean = name.endsWith(".m4a", ignoreCase = true)
 
@@ -39,6 +38,16 @@ fun formatTranscript(parts: List<String>): String {
     return text.split(SENTENCE_BOUNDARY)
         .chunked(SENTENCES_PER_PARAGRAPH)
         .joinToString("\n\n") { it.joinToString(" ") }
+}
+
+fun formatProviderTranscript(raw: String): String {
+    val paragraphs = raw.trim()
+        .replace("\r\n", "\n")
+        .split(BLANK_LINE)
+        .map { paragraph -> paragraph.replace(WHITESPACE, " ").trim() }
+        .filter(String::isNotEmpty)
+    if (paragraphs.isEmpty()) return ""
+    return if (paragraphs.size > 1) paragraphs.joinToString("\n\n") else formatTranscript(paragraphs)
 }
 
 class FolderStore(context: Context) {
@@ -105,24 +114,38 @@ class RecordingScanner(context: Context) {
 class TranscriptStore(context: Context) {
     private val directory = context.filesDir.resolve("transcripts")
 
-    fun exists(key: String, source: TranscriptSource = TranscriptSource.LOCAL): Boolean =
-        file(key, source).isFile
+    fun exists(key: String, profile: TranscriptionProfile): Boolean =
+        profileFiles(key, profile).any(File::isFile)
 
-    fun read(key: String, source: TranscriptSource = TranscriptSource.LOCAL): String? =
-        file(key, source).takeIf { it.isFile }?.readText(Charsets.UTF_8)
+    fun read(key: String, profile: TranscriptionProfile): String? =
+        profileFiles(key, profile).firstOrNull(File::isFile)?.readText(Charsets.UTF_8)
 
-    fun delete(key: String, source: TranscriptSource = TranscriptSource.LOCAL): Boolean =
-        !file(key, source).exists() || file(key, source).delete()
+    fun readAll(key: String): Map<TranscriptionProfile, String> = buildMap {
+        for (profile in TranscriptionProfile.ALL) {
+            read(key, profile)?.let { put(profile, it) }
+        }
+    }
 
-    fun write(
-        key: String,
-        transcript: String,
-        source: TranscriptSource = TranscriptSource.LOCAL,
-    ) {
+    fun hasAny(key: String): Boolean = directory.listFiles()?.any { file ->
+        file.isFile && file.name.endsWith(".txt") &&
+            (file.name == "$key.txt" || file.name.startsWith("$key-"))
+    } == true
+
+    fun delete(key: String, profile: TranscriptionProfile): Boolean =
+        profileFiles(key, profile).all { !it.exists() || it.delete() }
+
+    fun write(key: String, transcript: String, profile: TranscriptionProfile) {
         require(transcript.isNotBlank()) { "Transcript is blank" }
         check(directory.mkdirs() || directory.isDirectory) { "Cannot create transcript directory" }
+        writeAtomically(directory.resolve(transcriptFileName(key, profile)), transcript)
+    }
 
-        val target = file(key, source)
+    private fun profileFiles(key: String, profile: TranscriptionProfile): List<File> = buildList {
+        add(directory.resolve(transcriptFileName(key, profile)))
+        legacyTranscriptFileName(key, profile)?.let { add(directory.resolve(it)) }
+    }.distinct()
+
+    private fun writeAtomically(target: File, transcript: String) {
         val temporary = directory.resolve("${target.name}.tmp")
         temporary.writeText(transcript, Charsets.UTF_8)
         try {
@@ -136,12 +159,27 @@ class TranscriptStore(context: Context) {
             Files.move(temporary.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
         }
     }
-
-    private fun file(key: String, source: TranscriptSource) = directory.resolve(
-        if (source == TranscriptSource.LOCAL) "$key.txt" else "$key-${source.id}.txt",
-    )
 }
 
 private val WHITESPACE = Regex("\\s+")
+private val BLANK_LINE = Regex("\\n\\s*\\n")
 private val SENTENCE_BOUNDARY = Regex("(?<=[.!?])\\s+")
 private const val SENTENCES_PER_PARAGRAPH = 3
+
+private val LEGACY_LOCAL_PROFILE = TranscriptionProfile.LOCAL_CZECH
+
+private val LEGACY_CLOUD_PROFILES = mapOf(
+    TranscriptionProfile(
+        TranscriptionModel.OPENAI_GPT_4O,
+        TranscriptionLanguage.CZECH,
+    ) to "openai",
+    TranscriptionProfile(
+        TranscriptionModel.GEMINI_3_7_FLASH,
+        TranscriptionLanguage.CZECH,
+    ) to "gemini",
+    TranscriptionProfile(
+        TranscriptionModel.XAI_SPEECH_TO_TEXT,
+        TranscriptionLanguage.CZECH,
+    ) to "xai",
+    TranscriptionProfile.DEFAULT to "groq",
+)

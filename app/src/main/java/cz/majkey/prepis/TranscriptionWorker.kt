@@ -37,6 +37,12 @@ class TranscriptionWorker(
     parameters: WorkerParameters,
 ) : CoroutineWorker(appContext, parameters) {
     override suspend fun doWork(): Result {
+        val profile = runCatching {
+            TranscriptionProfile.fromIds(
+                inputData.getString(KEY_MODEL) ?: return Result.failure(),
+                inputData.getString(KEY_LANGUAGE) ?: return Result.failure(),
+            )
+        }.getOrNull()?.takeIf { it.model.isLocal } ?: return Result.failure()
         val uri = inputData.getString(KEY_URI)?.let(Uri::parse) ?: return Result.failure()
         val key = inputData.getString(KEY_RECORDING) ?: return Result.failure()
         val name = inputData.getString(KEY_NAME) ?: return Result.failure()
@@ -53,9 +59,15 @@ class TranscriptionWorker(
                 applicationContext.getString(R.string.notification_transcribing, name),
             )
             val transcript = withContext(Dispatchers.IO) {
-                AudioTranscriber(applicationContext.contentResolver, modelDirectory).transcribe(uri)
+                AudioTranscriber(
+                    applicationContext.contentResolver,
+                    modelDirectory,
+                    profile.language,
+                ).transcribe(uri)
             }
-            withContext(Dispatchers.IO) { TranscriptStore(applicationContext).write(key, transcript) }
+            withContext(Dispatchers.IO) {
+                TranscriptStore(applicationContext).write(key, transcript, profile)
+            }
             Result.success()
         } catch (exception: CancellationException) {
             throw exception
@@ -104,7 +116,7 @@ class TranscriptionWorker(
     }
 
     companion object {
-        const val GLOBAL_TAG = "prepis-transcriptions"
+        const val GLOBAL_TAG = "transcriber-local-jobs"
         const val KEY_PHASE = "phase"
         const val KEY_ERROR = "error"
         const val PHASE_MODEL = "model"
@@ -113,15 +125,19 @@ class TranscriptionWorker(
         private const val KEY_URI = "uri"
         private const val KEY_RECORDING = "recording"
         private const val KEY_NAME = "name"
+        private const val KEY_MODEL = "model"
+        private const val KEY_LANGUAGE = "language"
         private const val NOTIFICATION_CHANNEL = "transcription"
         private const val MAX_DOWNLOAD_RETRIES = 4
 
-        fun recordingTag(key: String) = "recording-$key"
+        fun recordingTag(key: String, profile: TranscriptionProfile) = "recording-$key-${profile.id}"
 
-        fun input(recording: Recording) = workDataOf(
+        fun input(recording: Recording, profile: TranscriptionProfile) = workDataOf(
             KEY_URI to recording.uri.toString(),
             KEY_RECORDING to recording.key,
             KEY_NAME to recording.name,
+            KEY_MODEL to profile.model.id,
+            KEY_LANGUAGE to profile.language.id,
         )
     }
 }
@@ -131,18 +147,25 @@ class TranscriptionQueue(context: Context) {
     private val manager = WorkManager.getInstance(appContext)
     private val transcripts = TranscriptStore(appContext)
 
-    suspend fun enqueueMissing(recordings: List<Recording>) {
+    suspend fun enqueueMissing(
+        recordings: List<Recording>,
+        profile: TranscriptionProfile,
+    ) {
         for (recording in recordings) {
-            if (!transcripts.exists(recording.key)) enqueue(recording, automatic = true)
+            if (!transcripts.exists(recording.key, profile)) {
+                enqueue(recording, profile, automatic = true)
+            }
         }
     }
 
     suspend fun enqueue(
         recording: Recording,
+        profile: TranscriptionProfile,
         replace: Boolean = false,
         automatic: Boolean = false,
     ) = withContext(Dispatchers.IO) {
-        val tag = TranscriptionWorker.recordingTag(recording.key)
+        require(profile.model.isLocal) { "Local queue requires a local model" }
+        val tag = TranscriptionWorker.recordingTag(recording.key, profile)
         val existing = manager.getWorkInfosByTag(tag).get()
         val active = existing.any { it.state.isActive() }
         if (active) return@withContext
@@ -154,12 +177,12 @@ class TranscriptionQueue(context: Context) {
             return@withContext
         }
 
-        if (replace && !transcripts.delete(recording.key)) {
+        if (replace && !transcripts.delete(recording.key, profile)) {
             throw IOException("The previous transcript cannot be removed")
         }
 
         val request = OneTimeWorkRequestBuilder<TranscriptionWorker>()
-            .setInputData(TranscriptionWorker.input(recording))
+            .setInputData(TranscriptionWorker.input(recording, profile))
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             .addTag(TranscriptionWorker.GLOBAL_TAG)
             .addTag(tag)
@@ -200,7 +223,7 @@ internal class ModelStore(context: Context) {
     private fun install(model: ModelFile) {
         val target = directory.resolve(model.name)
         if (target.length() == model.size && target.sha256() == model.sha256) return
-        if (target.exists() && !target.delete()) throw IOException("Nelze nahradit ${model.name}")
+        if (target.exists() && !target.delete()) throw IOException("Cannot replace ${model.name}")
 
         val partial = directory.resolve("${model.name}.part")
         if (partial.length() > model.size && !partial.delete()) {
@@ -210,7 +233,7 @@ internal class ModelStore(context: Context) {
 
         if (partial.length() != model.size || partial.sha256() != model.sha256) {
             partial.delete()
-            throw ModelIntegrityException("Kontrola modelu ${model.name} selhala")
+            throw ModelIntegrityException("The integrity check for ${model.name} failed")
         }
         Files.move(
             partial.toPath(),
@@ -226,7 +249,7 @@ internal class ModelStore(context: Context) {
         connection.instanceFollowRedirects = true
         connection.connectTimeout = CONNECT_TIMEOUT_MS
         connection.readTimeout = READ_TIMEOUT_MS
-        connection.setRequestProperty("User-Agent", "Prepis-Android/0.1.0")
+        connection.setRequestProperty("User-Agent", "Transcriber-Android/0.2.0")
         if (offset > 0) connection.setRequestProperty("Range", "bytes=$offset-")
 
         try {
