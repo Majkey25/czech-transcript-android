@@ -29,4 +29,4 @@ jobs:
       - name: Test, lint, and build
         run: |
           chmod +x ./gradlew
-          ./gradlew testDebugUnitTest lintDebug assembleDebug
+          ./gradlew testDebugUnitTest lintDebug assembleDebug assembleRelease
