@@ -7,8 +7,8 @@ import kotlin.test.assertNull
 
 class TranscriptionSettingsTest {
     @Test
-    fun `quality default is Groq Large V3 in Czech`() {
-        assertEquals(TranscriptionModel.GROQ_LARGE_V3, TranscriptionProfile.DEFAULT.model)
+    fun `fresh install defaults to local Whisper Small in Czech`() {
+        assertEquals(TranscriptionModel.LOCAL_WHISPER_SMALL, TranscriptionProfile.DEFAULT.model)
         assertEquals(TranscriptionLanguage.CZECH, TranscriptionProfile.DEFAULT.language)
     }
 
@@ -62,7 +62,10 @@ class TranscriptionSettingsTest {
             TranscriptionModel.LOCAL_WHISPER_SMALL,
             TranscriptionLanguage.CZECH,
         )
-        val groqCzech = TranscriptionProfile.DEFAULT
+        val groqCzech = TranscriptionProfile(
+            TranscriptionModel.GROQ_LARGE_V3,
+            TranscriptionLanguage.CZECH,
+        )
         val groqEnglish = groqCzech.copy(language = TranscriptionLanguage.ENGLISH)
 
         assertEquals("recording.txt", transcriptFileName("recording", localCzech))

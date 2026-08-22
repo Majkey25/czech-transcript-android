@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1 - 2026-08-22
+
+### Changed
+
+- Defaulted fresh installs to Local Whisper Small with Czech and no API key.
+- Kept every cloud model available as an optional Settings choice.
+
+### Fixed
+
+- Kept the legacy Groq transcript mapping independent from the default profile.
+
 ## 0.2.0 - 2026-08-22
 
 ### Added

@@ -181,5 +181,8 @@ private val LEGACY_CLOUD_PROFILES = mapOf(
         TranscriptionModel.XAI_SPEECH_TO_TEXT,
         TranscriptionLanguage.CZECH,
     ) to "xai",
-    TranscriptionProfile.DEFAULT to "groq",
+    TranscriptionProfile(
+        TranscriptionModel.GROQ_LARGE_V3,
+        TranscriptionLanguage.CZECH,
+    ) to "groq",
 )

@@ -44,7 +44,12 @@ class CloudLogicTest {
 
     @Test
     fun `Groq request uses selected model and Czech hint`() {
-        val fields = multipartFields(TranscriptionProfile.DEFAULT)
+        val fields = multipartFields(
+            TranscriptionProfile(
+                TranscriptionModel.GROQ_LARGE_V3,
+                TranscriptionLanguage.CZECH,
+            ),
+        )
 
         assertEquals("whisper-large-v3", fields["model"])
         assertEquals("cs", fields["language"])
@@ -55,7 +60,10 @@ class CloudLogicTest {
     @Test
     fun `auto detection omits language and invalid xAI formatting pair`() {
         val groq = multipartFields(
-            TranscriptionProfile.DEFAULT.copy(language = TranscriptionLanguage.AUTO),
+            TranscriptionProfile(
+                TranscriptionModel.GROQ_LARGE_V3,
+                TranscriptionLanguage.AUTO,
+            ),
         )
         val xai = multipartFields(
             TranscriptionProfile(
@@ -97,7 +105,7 @@ class CloudLogicTest {
         assertTrue(geminiPrompt(profile.language).contains("Czech"))
         assertTrue(geminiPrompt(TranscriptionLanguage.AUTO).lowercase().contains("detect"))
         assertFailsWith<IllegalArgumentException> {
-            geminiGenerateUrl(TranscriptionProfile.DEFAULT)
+            geminiGenerateUrl(TranscriptionProfile.LOCAL_CZECH)
         }
     }
 

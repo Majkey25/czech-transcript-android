@@ -12,11 +12,11 @@ selected independently in Settings.
 4. New recordings run sequentially and appear newest first.
 5. Open a recording to read, copy, or compare model/language versions.
 
-The free-tier-oriented default is Groq Whisper Large V3 with Czech as the language.
-Without a Groq key, recordings show an API-key-required state and no audio is
-uploaded. Groq documents a 25 MB direct-upload limit on its free tier and recommends
-Whisper Large V3 for error-sensitive multilingual work. OpenAI recommends GPT
-Transcribe for recorded speech when a paid OpenAI key is available.
+The default is Local Whisper Small with Czech as the language. The first local job
+downloads the verified 375,485,327-byte model; later jobs work offline without an
+API key. Cloud models remain optional in Settings. Groq documents a 25 MB direct-upload
+limit on its free tier. OpenAI recommends GPT Transcribe for recorded speech when a
+paid OpenAI key is available.
 
 ## Models
 
